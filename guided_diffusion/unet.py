@@ -16,6 +16,7 @@ from .nn import (
     zero_module,
     normalization,
     timestep_embedding,
+    make_neighborhood_mask,
 )
 
 
@@ -271,6 +272,8 @@ class AttentionBlock(nn.Module):
         num_head_channels=-1,
         use_checkpoint=False,
         use_new_attention_order=False,
+        spatial=None,
+        use_neighborhood_attention=False,
     ):
         super().__init__()
         self.channels = channels
@@ -286,10 +289,10 @@ class AttentionBlock(nn.Module):
         self.qkv = conv_nd(1, channels, channels * 3, 1)
         if use_new_attention_order:
             # split qkv before split heads
-            self.attention = QKVAttention(self.num_heads)
+            self.attention = QKVAttention(self.num_heads, spatial, use_neighborhood_attention)
         else:
             # split heads before split qkv
-            self.attention = QKVAttentionLegacy(self.num_heads)
+            self.attention = QKVAttentionLegacy(self.num_heads, spatial, use_neighborhood_attention)
 
         self.proj_out = zero_module(conv_nd(1, channels, channels, 1))
 
@@ -300,7 +303,7 @@ class AttentionBlock(nn.Module):
         b, c, *spatial = x.shape
         x = x.reshape(b, c, -1)
         qkv = self.qkv(self.norm(x))
-        h = self.attention(qkv)
+        h = self.attention(qkv, spatial)
         h = self.proj_out(h)
         return (x + h).reshape(b, c, *spatial)
 
@@ -330,11 +333,23 @@ class QKVAttentionLegacy(nn.Module):
     A module which performs QKV attention. Matches legacy QKVAttention + input/ouput heads shaping
     """
 
-    def __init__(self, n_heads):
+    def __init__(self, n_heads, spatial=None, use_neighborhood_attention=False):
         super().__init__()
         self.n_heads = n_heads
+        self.spatial = tuple(spatial)
+        self.use_neighborhood_attention = use_neighborhood_attention
+        self.neighborhood_mask_cache = {}
 
-    def forward(self, qkv):
+    def get_neighborhood_mask(self, spatial, device):
+        key = (*spatial, device)
+        if key in self.neighborhood_mask_cache:
+            return self.neighborhood_mask_cache[key]
+        spatial_orig = min(self.spatial[0], spatial[0]), min(self.spatial[1], spatial[1])
+        mask = make_neighborhood_mask(spatial, spatial_orig, device=device)
+        self.neighborhood_mask_cache[key] = mask
+        return mask
+
+    def forward(self, qkv, spatial=None):
         """
         Apply QKV attention.
 
@@ -349,6 +364,8 @@ class QKVAttentionLegacy(nn.Module):
         weight = th.einsum(
             "bct,bcs->bts", q * scale, k * scale
         )  # More stable with f16 than dividing afterwards
+        if self.use_neighborhood_attention:
+            weight.masked_fill_(~self.get_neighborhood_mask(spatial, weight.device), float("-inf"))
         weight = th.softmax(weight.float(), dim=-1).type(weight.dtype)
         a = th.einsum("bts,bcs->bct", weight, v)
         return a.reshape(bs, -1, length)
@@ -363,11 +380,23 @@ class QKVAttention(nn.Module):
     A module which performs QKV attention and splits in a different order.
     """
 
-    def __init__(self, n_heads):
+    def __init__(self, n_heads, spatial=None, use_neighborhood_attention=False):
         super().__init__()
         self.n_heads = n_heads
+        self.spatial = tuple(spatial)
+        self.use_neighborhood_attention = use_neighborhood_attention
+        self.neighborhood_mask_cache = {}
 
-    def forward(self, qkv):
+    def get_neighborhood_mask(self, spatial, device):
+        key = (*spatial, device)
+        if key in self.neighborhood_mask_cache:
+            return self.neighborhood_mask_cache[key]
+        spatial_orig = min(self.spatial[0], spatial[0]), min(self.spatial[1], spatial[1])
+        mask = make_neighborhood_mask(spatial, spatial_orig, device=device)
+        self.neighborhood_mask_cache[key] = mask
+        return mask
+
+    def forward(self, qkv, spatial=None):
         """
         Apply QKV attention.
 
@@ -384,6 +413,8 @@ class QKVAttention(nn.Module):
             (q * scale).view(bs * self.n_heads, ch, length),
             (k * scale).view(bs * self.n_heads, ch, length),
         )  # More stable with f16 than dividing afterwards
+        if self.use_neighborhood_attention:
+            weight.masked_fill_(~self.get_neighborhood_mask(spatial, weight.device), float("-inf"))
         weight = th.softmax(weight.float(), dim=-1).type(weight.dtype)
         a = th.einsum("bts,bcs->bct", weight, v.reshape(bs * self.n_heads, ch, length))
         return a.reshape(bs, -1, length)
@@ -445,6 +476,7 @@ class UNetModel(nn.Module):
         use_scale_shift_norm=False,
         resblock_updown=False,
         use_new_attention_order=False,
+        use_neighborhood_attention=False,
     ):
         super().__init__()
 
@@ -466,6 +498,7 @@ class UNetModel(nn.Module):
         self.num_heads = num_heads
         self.num_head_channels = num_head_channels
         self.num_heads_upsample = num_heads_upsample
+        self.use_neighborhood_attention = use_neighborhood_attention
 
         time_embed_dim = model_channels * 4
         self.time_embed = nn.Sequential(
@@ -506,6 +539,8 @@ class UNetModel(nn.Module):
                             num_heads=num_heads,
                             num_head_channels=num_head_channels,
                             use_new_attention_order=use_new_attention_order,
+                            spatial=(image_size // ds, image_size // ds),
+                            use_neighborhood_attention=use_neighborhood_attention,
                         )
                     )
                 self.input_blocks.append(TimestepEmbedSequential(*layers))
@@ -551,6 +586,8 @@ class UNetModel(nn.Module):
                 num_heads=num_heads,
                 num_head_channels=num_head_channels,
                 use_new_attention_order=use_new_attention_order,
+                spatial=(image_size // ds, image_size // ds),
+                use_neighborhood_attention=use_neighborhood_attention,
             ),
             ResBlock(
                 ch,
@@ -587,6 +624,8 @@ class UNetModel(nn.Module):
                             num_heads=num_heads_upsample,
                             num_head_channels=num_head_channels,
                             use_new_attention_order=use_new_attention_order,
+                            spatial=(image_size // ds, image_size // ds),
+                            use_neighborhood_attention=use_neighborhood_attention,
                         )
                     )
                 if level and i == num_res_blocks:
@@ -708,6 +747,7 @@ class EncoderUNetModel(nn.Module):
         resblock_updown=False,
         use_new_attention_order=False,
         pool="adaptive",
+        use_neighborhood_attention=False,
     ):
         super().__init__()
 
@@ -727,6 +767,7 @@ class EncoderUNetModel(nn.Module):
         self.num_heads = num_heads
         self.num_head_channels = num_head_channels
         self.num_heads_upsample = num_heads_upsample
+        self.use_neighborhood_attention = use_neighborhood_attention
 
         time_embed_dim = model_channels * 4
         self.time_embed = nn.Sequential(
@@ -764,6 +805,8 @@ class EncoderUNetModel(nn.Module):
                             num_heads=num_heads,
                             num_head_channels=num_head_channels,
                             use_new_attention_order=use_new_attention_order,
+                            spatial=(image_size // ds, image_size // ds),
+                            use_neighborhood_attention=use_neighborhood_attention,
                         )
                     )
                 self.input_blocks.append(TimestepEmbedSequential(*layers))
@@ -802,12 +845,14 @@ class EncoderUNetModel(nn.Module):
                 dims=dims,
                 use_checkpoint=use_checkpoint,
                 use_scale_shift_norm=use_scale_shift_norm,
+                use_neighborhood_attention=use_neighborhood_attention,
             ),
             AttentionBlock(
                 ch,
                 use_checkpoint=use_checkpoint,
                 num_heads=num_heads,
                 num_head_channels=num_head_channels,
+                spatial=(image_size // ds, image_size // ds),
                 use_new_attention_order=use_new_attention_order,
             ),
             ResBlock(

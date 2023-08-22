@@ -188,3 +188,27 @@ class CheckpointFunction(th.autograd.Function):
         for (i, g) in zip(input_indices, computed_grads):
             input_grads[i] = g
         return (None, None) + tuple(input_grads)
+
+
+def make_neighborhood_mask(spatial, spatial_orig, device="cpu"):
+    h, w = spatial
+    h_orig, w_orig = spatial_orig
+
+    h_ramp = th.arange(h, device=device)
+    w_ramp = th.arange(w, device=device)
+    h_pos, w_pos = th.meshgrid(h_ramp, w_ramp, indexing="ij")
+
+    # Compute start_h and end_h
+    start_h = th.clamp(h_pos - h_orig // 2, 0, h - h_orig)[..., None, None]
+    end_h = start_h + h_orig
+
+    # Compute start_w and end_w
+    start_w = th.clamp(w_pos - w_orig // 2, 0, w - w_orig)[..., None, None]
+    end_w = start_w + w_orig
+
+    # Broadcast and create the mask
+    h_range = h_ramp.reshape(1, 1, h, 1)
+    w_range = w_ramp.reshape(1, 1, 1, w)
+    mask = (h_range >= start_h) & (h_range < end_h) & (w_range >= start_w) & (w_range < end_w)
+
+    return mask.view(h * w, h * w)
