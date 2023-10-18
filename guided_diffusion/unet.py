@@ -6,6 +6,7 @@ import numpy as np
 import torch as th
 import torch.nn as nn
 import torch.nn.functional as F
+from einops import rearrange
 
 from .fp16_util import convert_module_to_f16, convert_module_to_f32
 from .nn import (
@@ -274,6 +275,7 @@ class AttentionBlock(nn.Module):
         use_new_attention_order=False,
         spatial=None,
         use_neighborhood_attention=False,
+        use_torch_sdp_attention=False,
     ):
         super().__init__()
         self.channels = channels
@@ -287,12 +289,14 @@ class AttentionBlock(nn.Module):
         self.use_checkpoint = use_checkpoint
         self.norm = normalization(channels)
         self.qkv = conv_nd(1, channels, channels * 3, 1)
+        if use_neighborhood_attention and use_torch_sdp_attention:
+            raise ValueError('Cannot satisfy both use_neighborhood_attention:True and use_torch_sdp_attention:True')
         if use_new_attention_order:
             # split qkv before split heads
-            self.attention = QKVAttention(self.num_heads, spatial, use_neighborhood_attention)
+            self.attention = QKVAttention(self.num_heads, spatial, use_neighborhood_attention, use_torch_sdp_attention)
         else:
             # split heads before split qkv
-            self.attention = QKVAttentionLegacy(self.num_heads, spatial, use_neighborhood_attention)
+            self.attention = QKVAttentionLegacy(self.num_heads, spatial, use_neighborhood_attention, use_torch_sdp_attention)
 
         self.proj_out = zero_module(conv_nd(1, channels, channels, 1))
 
@@ -333,11 +337,14 @@ class QKVAttentionLegacy(nn.Module):
     A module which performs QKV attention. Matches legacy QKVAttention + input/ouput heads shaping
     """
 
-    def __init__(self, n_heads, spatial=None, use_neighborhood_attention=False):
+    def __init__(self, n_heads, spatial=None, use_neighborhood_attention=False, use_torch_sdp_attention=False):
         super().__init__()
         self.n_heads = n_heads
         self.spatial = tuple(spatial)
         self.use_neighborhood_attention = use_neighborhood_attention
+        self.use_torch_sdp_attention = use_torch_sdp_attention
+        if use_neighborhood_attention and use_torch_sdp_attention:
+            raise ValueError('Cannot satisfy both use_neighborhood_attention:True and use_torch_sdp_attention:True')
         self.neighborhood_mask_cache = {}
 
     def get_neighborhood_mask(self, spatial, device):
@@ -359,6 +366,11 @@ class QKVAttentionLegacy(nn.Module):
         bs, width, length = qkv.shape
         assert width % (3 * self.n_heads) == 0
         ch = width // (3 * self.n_heads)
+        if self.use_torch_sdp_attention:
+            q, k, v = rearrange(qkv, "n (h p c) t -> p n h t c", p=3, c=ch).unbind()
+            a = th.nn.functional.scaled_dot_product_attention(q, k, v)
+            a = rearrange(a, 'n h t c -> n (h c) t')
+            return a
         q, k, v = qkv.reshape(bs * self.n_heads, ch * 3, length).split(ch, dim=1)
         scale = 1 / math.sqrt(math.sqrt(ch))
         weight = th.einsum(
@@ -380,11 +392,14 @@ class QKVAttention(nn.Module):
     A module which performs QKV attention and splits in a different order.
     """
 
-    def __init__(self, n_heads, spatial=None, use_neighborhood_attention=False):
+    def __init__(self, n_heads, spatial=None, use_neighborhood_attention=False, use_torch_sdp_attention=False):
         super().__init__()
         self.n_heads = n_heads
         self.spatial = tuple(spatial)
         self.use_neighborhood_attention = use_neighborhood_attention
+        self.use_torch_sdp_attention = use_torch_sdp_attention
+        if use_neighborhood_attention and use_torch_sdp_attention:
+            raise ValueError('Cannot satisfy both use_neighborhood_attention:True and use_torch_sdp_attention:True')
         self.neighborhood_mask_cache = {}
 
     def get_neighborhood_mask(self, spatial, device):
@@ -406,6 +421,11 @@ class QKVAttention(nn.Module):
         bs, width, length = qkv.shape
         assert width % (3 * self.n_heads) == 0
         ch = width // (3 * self.n_heads)
+        if self.use_torch_sdp_attention:
+            q, k, v = rearrange(qkv, "n (p h c) t -> p n h t c", p=3, c=ch).unbind()
+            a = th.nn.functional.scaled_dot_product_attention(q, k, v)
+            a = rearrange(a, 'n h t c -> n (h c) t')
+            return a
         q, k, v = qkv.chunk(3, dim=1)
         scale = 1 / math.sqrt(math.sqrt(ch))
         weight = th.einsum(
@@ -477,6 +497,7 @@ class UNetModel(nn.Module):
         resblock_updown=False,
         use_new_attention_order=False,
         use_neighborhood_attention=False,
+        use_torch_sdp_attention=False,
     ):
         super().__init__()
 
@@ -499,6 +520,9 @@ class UNetModel(nn.Module):
         self.num_head_channels = num_head_channels
         self.num_heads_upsample = num_heads_upsample
         self.use_neighborhood_attention = use_neighborhood_attention
+        self.use_torch_sdp_attention = use_torch_sdp_attention
+        if use_neighborhood_attention and use_torch_sdp_attention:
+            raise ValueError('Cannot satisfy both use_neighborhood_attention:True and use_torch_sdp_attention:True')
 
         time_embed_dim = model_channels * 4
         self.time_embed = nn.Sequential(
@@ -541,6 +565,7 @@ class UNetModel(nn.Module):
                             use_new_attention_order=use_new_attention_order,
                             spatial=(image_size // ds, image_size // ds),
                             use_neighborhood_attention=use_neighborhood_attention,
+                            use_torch_sdp_attention=use_torch_sdp_attention,
                         )
                     )
                 self.input_blocks.append(TimestepEmbedSequential(*layers))
@@ -588,6 +613,7 @@ class UNetModel(nn.Module):
                 use_new_attention_order=use_new_attention_order,
                 spatial=(image_size // ds, image_size // ds),
                 use_neighborhood_attention=use_neighborhood_attention,
+                use_torch_sdp_attention=use_torch_sdp_attention,
             ),
             ResBlock(
                 ch,
@@ -626,6 +652,7 @@ class UNetModel(nn.Module):
                             use_new_attention_order=use_new_attention_order,
                             spatial=(image_size // ds, image_size // ds),
                             use_neighborhood_attention=use_neighborhood_attention,
+                            use_torch_sdp_attention=use_torch_sdp_attention,
                         )
                     )
                 if level and i == num_res_blocks:
@@ -748,6 +775,7 @@ class EncoderUNetModel(nn.Module):
         use_new_attention_order=False,
         pool="adaptive",
         use_neighborhood_attention=False,
+        use_torch_sdp_attention=False,
     ):
         super().__init__()
 
@@ -768,6 +796,9 @@ class EncoderUNetModel(nn.Module):
         self.num_head_channels = num_head_channels
         self.num_heads_upsample = num_heads_upsample
         self.use_neighborhood_attention = use_neighborhood_attention
+        self.use_torch_sdp_attention = use_torch_sdp_attention
+        if use_neighborhood_attention and use_torch_sdp_attention:
+            raise ValueError('Cannot satisfy both use_neighborhood_attention:True and use_torch_sdp_attention:True')
 
         time_embed_dim = model_channels * 4
         self.time_embed = nn.Sequential(
@@ -807,6 +838,7 @@ class EncoderUNetModel(nn.Module):
                             use_new_attention_order=use_new_attention_order,
                             spatial=(image_size // ds, image_size // ds),
                             use_neighborhood_attention=use_neighborhood_attention,
+                            use_torch_sdp_attention=use_torch_sdp_attention,
                         )
                     )
                 self.input_blocks.append(TimestepEmbedSequential(*layers))
@@ -846,6 +878,7 @@ class EncoderUNetModel(nn.Module):
                 use_checkpoint=use_checkpoint,
                 use_scale_shift_norm=use_scale_shift_norm,
                 use_neighborhood_attention=use_neighborhood_attention,
+                use_torch_sdp_attention=use_torch_sdp_attention,
             ),
             AttentionBlock(
                 ch,
