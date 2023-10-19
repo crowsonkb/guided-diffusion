@@ -367,7 +367,7 @@ class QKVAttentionLegacy(nn.Module):
         assert width % (3 * self.n_heads) == 0
         ch = width // (3 * self.n_heads)
         if self.use_torch_sdp_attention:
-            q, k, v = rearrange(qkv, "n (h p c) t -> p n h t c", p=3, c=ch).unbind()
+            q, k, v = rearrange(qkv, "n (h p c) t -> p n h t c", p=3, c=ch).contiguous().unbind()
             a = th.nn.functional.scaled_dot_product_attention(q, k, v)
             a = rearrange(a, 'n h t c -> n (h c) t')
             return a
@@ -422,7 +422,7 @@ class QKVAttention(nn.Module):
         assert width % (3 * self.n_heads) == 0
         ch = width // (3 * self.n_heads)
         if self.use_torch_sdp_attention:
-            q, k, v = rearrange(qkv, "n (p h c) t -> p n h t c", p=3, c=ch).unbind()
+            q, k, v = rearrange(qkv, "n (p h c) t -> p n h t c", p=3, c=ch).contiguous().unbind()
             a = th.nn.functional.scaled_dot_product_attention(q, k, v)
             a = rearrange(a, 'n h t c -> n (h c) t')
             return a
