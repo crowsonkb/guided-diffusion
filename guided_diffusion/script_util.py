@@ -97,6 +97,7 @@ def create_model_and_diffusion(
     use_fp16,
     use_new_attention_order,
     use_neighborhood_attention,
+    use_torch_sdp_attention,
 ):
     model = create_model(
         image_size,
@@ -116,6 +117,7 @@ def create_model_and_diffusion(
         use_fp16=use_fp16,
         use_new_attention_order=use_new_attention_order,
         use_neighborhood_attention=use_neighborhood_attention,
+        use_torch_sdp_attention=use_torch_sdp_attention,
     )
     diffusion = create_gaussian_diffusion(
         steps=diffusion_steps,
@@ -148,6 +150,7 @@ def create_model(
     use_fp16=False,
     use_new_attention_order=False,
     use_neighborhood_attention=False,
+    use_torch_sdp_attention=False,
 ):
     if channel_mult == "":
         if image_size == 512:
@@ -186,6 +189,7 @@ def create_model(
         resblock_updown=resblock_updown,
         use_new_attention_order=use_new_attention_order,
         use_neighborhood_attention=use_neighborhood_attention,
+        use_torch_sdp_attention=use_torch_sdp_attention,
     )
 
 
